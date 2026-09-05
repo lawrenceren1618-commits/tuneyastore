@@ -447,18 +447,40 @@ h2 {
   color: white;
 }
 
-[data-lang-block] {
+/* Default: English visible even before JS (avoids blank first paint) */
+[data-lang-block="zh"] {
   display: none;
 }
 
-html[lang="en"] [data-lang-block="en"],
-html[lang="zh"] [data-lang-block="zh"] {
+[data-lang-block="en"] {
   display: block;
 }
 
-html[lang="en"] .nav [data-lang-block="en"],
-html[lang="zh"] .nav [data-lang-block="zh"],
-html[lang="en"] .inline-lang[data-lang-block="en"],
-html[lang="zh"] .inline-lang[data-lang-block="zh"] {
+.inline-lang[data-lang-block="en"],
+.nav [data-lang-block="en"] {
   display: inline;
+}
+
+.inline-lang[data-lang-block="zh"],
+.nav [data-lang-block="zh"] {
+  display: none;
+}
+
+/* Chinese UI mode via data-ui-lang (set by site.js) */
+html[data-ui-lang="zh"] [data-lang-block="en"] {
+  display: none;
+}
+
+html[data-ui-lang="zh"] [data-lang-block="zh"] {
+  display: block;
+}
+
+html[data-ui-lang="zh"] .inline-lang[data-lang-block="zh"],
+html[data-ui-lang="zh"] .nav [data-lang-block="zh"] {
+  display: inline;
+}
+
+html[data-ui-lang="zh"] .inline-lang[data-lang-block="en"],
+html[data-ui-lang="zh"] .nav [data-lang-block="en"] {
+  display: none;
 }

@@ -4,7 +4,9 @@
 
   function applyLang(lang) {
     var next = lang === "zh" ? "zh" : "en";
-    document.documentElement.lang = next;
+    var root = document.documentElement;
+    root.lang = next;
+    root.setAttribute("data-ui-lang", next);
     try {
       localStorage.setItem("tuneya-lang", next);
     } catch (e) {}
