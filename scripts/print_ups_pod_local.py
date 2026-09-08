@@ -3,6 +3,7 @@
 
 Usage:
   python scripts/print_ups_pod_local.py --workers 2 1ZK3526F6818647950
+  python scripts/print_ups_pod_local.py --retry-from output/pods/.../结果清单.csv --workers 2 1ZK3526F6818647950
 """
 
 from __future__ import annotations
@@ -389,6 +390,47 @@ def write_csv(path: Path, rows: Sequence[ResultRow]) -> None:
             )
 
 
+RETRYABLE_RESULTS = frozenset({STATUS_DELAYED, STATUS_IN_TRANSIT, STATUS_FAILED})
+
+
+def load_result_csv(path: Path) -> List[ResultRow]:
+    """Load prior 结果清单.csv rows (utf-8-sig)."""
+    rows: List[ResultRow] = []
+    with path.open("r", newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        for raw in reader:
+            tn = (raw.get("追踪编号") or "").strip().upper()
+            if not tn:
+                continue
+            rows.append(
+                ResultRow(
+                    tn=tn,
+                    result=(raw.get("结果") or "").strip(),
+                    note=(raw.get("备注") or "").strip(),
+                    pdf=(raw.get("PDF") or "").strip(),
+                    validated=(raw.get("校验") or "").strip(),
+                )
+            )
+    return rows
+
+
+def split_retry_rows(
+    prior: Sequence[ResultRow],
+) -> Tuple[List[ResultRow], List[str]]:
+    """Keep 已下载PDF rows; return TNs to re-run (延迟/在途/失败)."""
+    keep: List[ResultRow] = []
+    retry_tns: List[str] = []
+    for row in prior:
+        if row.result == STATUS_DOWNLOADED:
+            keep.append(row)
+        elif row.result in RETRYABLE_RESULTS or not row.result:
+            retry_tns.append(row.tn)
+        else:
+            # Unknown status: treat as retryable so nothing is silently dropped.
+            retry_tns.append(row.tn)
+    return keep, retry_tns
+
+
 def process_tn(tn: str, out_dir: Path) -> ResultRow:
     """Two-phase per TN: probe status, then print PoD PDF if delivered."""
 
@@ -442,9 +484,43 @@ def process_tn(tn: str, out_dir: Path) -> ResultRow:
     return with_own_browser(_run)
 
 
-def process_all(seed: str, out_dir: Path, workers: int) -> dict:
+def process_all(
+    seed: str,
+    out_dir: Path,
+    workers: int,
+    retry_from: Optional[Path] = None,
+) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
     state = RunState()
+    kept_rows: List[ResultRow] = []
+    retry_only: Optional[List[str]] = None
+
+    if retry_from is not None:
+        prior = load_result_csv(retry_from)
+        kept_rows, retry_only = split_retry_rows(prior)
+        print(
+            f"[retry-from] {retry_from}: keep_downloaded={len(kept_rows)} "
+            f"retry={len(retry_only)} tns={retry_only}",
+            flush=True,
+        )
+        if not retry_only:
+            print("[retry-from] nothing to retry; rewriting CSV from kept rows", flush=True)
+            state.rows.extend(kept_rows)
+            csv_path = out_dir / "结果清单.csv"
+            write_csv(csv_path, state.rows)
+            return {
+                "declared": None,
+                "parsed": len(state.rows),
+                "tns": [r.tn for r in state.rows],
+                "downloaded": sum(1 for r in state.rows if r.result == STATUS_DOWNLOADED),
+                "delayed": sum(1 for r in state.rows if r.result == STATUS_DELAYED),
+                "in_transit": sum(1 for r in state.rows if r.result == STATUS_IN_TRANSIT),
+                "failed": sum(1 for r in state.rows if r.result == STATUS_FAILED),
+                "validated_ok": sum(1 for r in state.rows if r.validated == "是"),
+                "csv": str(csv_path),
+                "out_dir": str(out_dir),
+                "rows": state.rows,
+            }
 
     def _collect(browser: Browser) -> Tuple[List[str], Optional[int]]:
         page = new_page(browser)
@@ -454,13 +530,18 @@ def process_all(seed: str, out_dir: Path, workers: int) -> dict:
         finally:
             page.context.close()
 
-    tns, declared = with_own_browser(_collect)
-    print(f"[collect] declared={declared} parsed={len(tns)} tns={tns}", flush=True)
-    if declared is not None and len(tns) != declared:
-        print(
-            f"[warn] TN count mismatch: declared {declared} vs parsed {len(tns)}",
-            flush=True,
-        )
+    if retry_only is not None:
+        tns = list(retry_only)
+        declared = None
+        print(f"[collect] skipped (retry-from); processing {len(tns)} TNs", flush=True)
+    else:
+        tns, declared = with_own_browser(_collect)
+        print(f"[collect] declared={declared} parsed={len(tns)} tns={tns}", flush=True)
+        if declared is not None and len(tns) != declared:
+            print(
+                f"[warn] TN count mismatch: declared {declared} vs parsed {len(tns)}",
+                flush=True,
+            )
 
     with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
         futs = [ex.submit(process_tn, tn, out_dir) for tn in tns]
@@ -473,16 +554,28 @@ def process_all(seed: str, out_dir: Path, workers: int) -> dict:
                 flush=True,
             )
 
-    order = {tn: i for i, tn in enumerate(tns)}
-    state.rows.sort(key=lambda r: order.get(r.tn, 10_000))
+    if kept_rows:
+        # Merge kept 已下载PDF with freshly retried rows; prefer new results on TN clash.
+        by_tn = {r.tn: r for r in kept_rows}
+        for r in state.rows:
+            by_tn[r.tn] = r
+        # Preserve CSV order: prior keep order, then any new TNs.
+        prior_order = [r.tn for r in kept_rows] + [
+            tn for tn in tns if tn not in {r.tn for r in kept_rows}
+        ]
+        order = {tn: i for i, tn in enumerate(prior_order)}
+        state.rows = sorted(by_tn.values(), key=lambda r: order.get(r.tn, 10_000))
+    else:
+        order = {tn: i for i, tn in enumerate(tns)}
+        state.rows.sort(key=lambda r: order.get(r.tn, 10_000))
 
     csv_path = out_dir / "结果清单.csv"
     write_csv(csv_path, state.rows)
 
     return {
         "declared": declared,
-        "parsed": len(tns),
-        "tns": tns,
+        "parsed": len(tns) if retry_only is None else len(state.rows),
+        "tns": [r.tn for r in state.rows] if kept_rows else tns,
         "downloaded": sum(1 for r in state.rows if r.result == STATUS_DOWNLOADED),
         "delayed": sum(1 for r in state.rows if r.result == STATUS_DELAYED),
         "in_transit": sum(1 for r in state.rows if r.result == STATUS_IN_TRANSIT),
@@ -531,6 +624,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         action="store_true",
         help="Skip ups.com reachability probe",
     )
+    parser.add_argument(
+        "--retry-from",
+        type=Path,
+        default=None,
+        help=(
+            "Path to prior 结果清单.csv: keep 已下载PDF rows, "
+            "only re-run 延迟/在途/失败 (writes into --out-root/<seed>+<day>)"
+        ),
+    )
     args = parser.parse_args(argv)
 
     seed = args.seed.strip().upper()
@@ -541,8 +643,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     workers = max(1, min(args.workers, 3))
     day = datetime.now(timezone.utc).astimezone().strftime("%Y%m%d")
     out_dir = args.out_root / f"{seed}+{day}"
+    retry_from = args.retry_from
+    if retry_from is not None:
+        retry_from = retry_from.expanduser().resolve()
+        if not retry_from.is_file():
+            print(f"ERROR: --retry-from not found: {retry_from}", file=sys.stderr)
+            return 2
+        # Prefer writing beside the source CSV when retrying an existing folder.
+        if retry_from.parent.name.startswith(seed):
+            out_dir = retry_from.parent
 
     print(f"seed={seed} workers={workers} out={out_dir}", flush=True)
+    if retry_from is not None:
+        print(f"retry_from={retry_from}", flush=True)
 
     if not args.skip_reachability:
         ok, detail = check_reachability()
@@ -552,7 +665,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 3
 
     try:
-        summary = process_all(seed, out_dir, workers)
+        summary = process_all(seed, out_dir, workers, retry_from=retry_from)
     except Exception:  # noqa: BLE001
         traceback.print_exc()
         return 1
